@@ -43,7 +43,7 @@ def main():
     # Handle command line input
     ##
 
-    num_clips = 5000000
+    num_clips = 100
 
     try:
         opts, _ = getopt.getopt(sys.argv[1:], 'n:t:c:oH',
@@ -72,7 +72,7 @@ def main():
     ##
     # Process data for training
     ##
-
+    c.clear_dir(c.TRAIN_DIR_CLIPS)
     process_training_data(num_clips)
 
 

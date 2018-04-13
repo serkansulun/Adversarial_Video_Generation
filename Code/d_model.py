@@ -5,7 +5,8 @@ from skimage.transform import resize
 from d_scale_model import DScaleModel
 from loss_functions import adv_loss
 import constants as c
-
+from myutils import batch_resize
+from debug import display_batch
 
 # noinspection PyShadowingNames
 class DiscriminatorModel:
@@ -75,31 +76,32 @@ class DiscriminatorModel:
 
             self.labels = tf.placeholder(tf.float32, shape=[None, 1], name='labels')
 
+
             ##
             # Training
             ##
 
             with tf.name_scope('training'):
                 # global loss is the combined loss from every scale network
-                self.global_loss = adv_loss(self.scale_preds, self.labels)
+                self.global_loss, self.real_loss, self.fake_loss = adv_loss(self.scale_preds, self.labels)
                 self.global_step = tf.Variable(0, trainable=False, name='global_step')
-                self.optimizer = tf.train.GradientDescentOptimizer(c.LRATE_D, name='optimizer')
+                self.optimizer = tf.train.AdamOptimizer(c.LRATE_D, name='optimizer')
                 self.train_op = self.optimizer.minimize(self.global_loss,
                                                         global_step=self.global_step,
                                                         name='train_op')
 
                 # add summaries to visualize in TensorBoard
-                loss_summary = tf.scalar_summary('loss_D', self.global_loss)
-                self.summaries = tf.merge_summary([loss_summary])
+                loss_summary = tf.summary.scalar('loss_D', self.global_loss)
+                self.summaries = tf.summary.merge([loss_summary])
 
-    def build_feed_dict(self, input_frames, gt_output_frames, generator):
+    def build_feed_dict(self, batch, generator):
         """
         Builds a feed_dict with resized inputs and outputs for each scale network.
 
         @param input_frames: An array of shape
-                             [batch_size x self.height x self.width x (3 * HIST_LEN)], The frames to
+                             [batch_size x self.height x self.width x (c.CHANNELS * HIST_LEN)], The frames to
                              use for generation.
-        @param gt_output_frames: An array of shape [batch_size x self.height x self.width x 3], The
+        @param gt_output_frames: An array of shape [batch_size x self.height x self.width x c.CHANNELS], The
                                  ground truth outputs for each sequence in input_frames.
         @param generator: The generator model.
 
@@ -107,7 +109,16 @@ class DiscriminatorModel:
                  predictions.
         """
         feed_dict = {}
-        batch_size = np.shape(gt_output_frames)[0]
+        real_feed_dict = {}
+        fake_feed_dict = {}
+        batch_size = np.shape(batch)[0]
+
+        ##
+        # Split into inputs and outputs
+        ##
+
+        input_frames = batch[:, :, :, :-c.CHANNELS]
+        gt_output_frames = batch[:, :, :, -c.CHANNELS:]
 
         ##
         # Get generated frames from GeneratorModel
@@ -123,65 +134,75 @@ class DiscriminatorModel:
         for scale_num in xrange(self.num_scale_nets):
             scale_net = self.scale_nets[scale_num]
 
-            # resize gt_output_frames
-            scaled_gt_output_frames = np.empty([batch_size, scale_net.height, scale_net.width, 3])
-            for i, img in enumerate(gt_output_frames):
-                # for skimage.transform.resize, images need to be in range [0, 1], so normalize to
-                # [0, 1] before resize and back to [-1, 1] after
-                sknorm_img = (img / 2) + 0.5
-                resized_frame = resize(sknorm_img, [scale_net.height, scale_net.width, 3])
-                scaled_gt_output_frames[i] = (resized_frame - 0.5) * 2
+            # resize sequence frames
+            # scaled_sequence_frames = np.empty([batch_size, scale_net.height, scale_net.width, batch.shape[-1]])
+            # for i, fr in enumerate(batch):
+            #     for j in range(0, batch.shape[-1], c.CHANNELS):
+            #         img = batch[i, :, :, j:j+c.CHANNELS]
+            #         scaled_sequence_frames[i, :, :, j:j + c.CHANNELS] = imresize(img, scale_net.width, scale_net.height)
+                    # for skimage.transform.resize, images need to be in range [0, 1], so normalize to
+                    # [0, 1] before resize and back to [-1, 1] after
+                    # sknorm_img = (img / 2) + 0.5
+                    # resized_frame = resize(sknorm_img, [scale_net.height, scale_net.width, c.CHANNELS])
+                    # scaled_sequence_frames[i, :, :, j:j+c.CHANNELS] = (resized_frame - 0.5) * 2
+            scaled_sequence_frames = batch_resize(batch, scale_net.height, scale_net.width)
+            scaled_hist_frames = scaled_sequence_frames[:, :, :, :c.HIST_LEN * c.CHANNELS]
+
+            # concatenate gt history and predicted next frames to create fake sample for discriminator
+            gen_sequence = np.concatenate((scaled_hist_frames, g_scale_preds[scale_num]), axis=-1)
 
             # combine with resized gt_output_frames to get inputs for prediction
-            scaled_input_frames = np.concatenate([g_scale_preds[scale_num],
-                                                  scaled_gt_output_frames])
+            scaled_input_frames = np.concatenate([gen_sequence, scaled_sequence_frames])
 
             # convert to np array and add to feed_dict
             feed_dict[scale_net.input_frames] = scaled_input_frames
+            real_feed_dict[scale_net.input_frames] = scaled_sequence_frames
+            fake_feed_dict[scale_net.input_frames] = gen_sequence
 
         # add labels for each image to feed_dict
         batch_size = np.shape(input_frames)[0]
         feed_dict[self.labels] = np.concatenate([np.zeros([batch_size, 1]),
                                                  np.ones([batch_size, 1])])
+        real_feed_dict[self.labels] = np.ones([batch_size, 1])
+        fake_feed_dict[self.labels] = np.zeros([batch_size, 1])
 
-        return feed_dict
+
+        return feed_dict, real_feed_dict, fake_feed_dict
 
     def train_step(self, batch, generator):
         """
         Runs a training step using the global loss on each of the scale networks.
 
         @param batch: An array of shape
-                      [BATCH_SIZE x self.height x self.width x (3 * (HIST_LEN + 1))]. The input
+                      [BATCH_SIZE x self.height x self.width x (c.CHANNELS * (HIST_LEN + 1))]. The input
                       and output frames, concatenated along the channel axis (index 3).
         @param generator: The generator model.
 
         @return: The global step.
         """
-        ##
-        # Split into inputs and outputs
-        ##
-
-        input_frames = batch[:, :, :, :-3]
-        gt_output_frames = batch[:, :, :, -3:]
 
         ##
         # Train
         ##
 
-        feed_dict = self.build_feed_dict(input_frames, gt_output_frames, generator)
+        feed_dict, real_feed_dict, fake_feed_dict = self.build_feed_dict(batch, generator)
 
-        _, global_loss, global_step, summaries = self.sess.run(
-            [self.train_op, self.global_loss, self.global_step, self.summaries],
+        _, global_loss, real_loss, fake_loss, global_step, summaries, scale_preds, labels = self.sess.run(
+            [self.train_op, self.global_loss, self.real_loss, self.fake_loss, self.global_step, self.summaries, self.scale_preds, self.labels],
             feed_dict=feed_dict)
+
+
 
         ##
         # User output
         ##
 
+        #print np.matrix(np.asarray(scale_preds))
         if global_step % c.STATS_FREQ == 0:
             print 'DiscriminatorModel: step %d | global loss: %f' % (global_step, global_loss)
+
         if global_step % c.SUMMARY_FREQ == 0:
-            print 'DiscriminatorModel: saved summaries'
+            # print 'DiscriminatorModel: saved summaries'
             self.summary_writer.add_summary(summaries, global_step)
 
-        return global_step
+        return global_step, global_loss, real_loss, fake_loss

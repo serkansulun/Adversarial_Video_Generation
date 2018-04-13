@@ -8,6 +8,7 @@ import os
 import constants as c
 from loss_functions import combined_loss
 from utils import psnr_error, sharp_diff_error
+from myutils import batch_resize
 from tfutils import w, b
 
 # noinspection PyShadowingNames
@@ -59,14 +60,14 @@ class GeneratorModel:
 
             with tf.name_scope('data'):
                 self.input_frames_train = tf.placeholder(
-                    tf.float32, shape=[None, self.height_train, self.width_train, 3 * c.HIST_LEN])
+                    tf.float32, shape=[None, self.height_train, self.width_train, c.CHANNELS * c.HIST_LEN])
                 self.gt_frames_train = tf.placeholder(
-                    tf.float32, shape=[None, self.height_train, self.width_train, 3])
+                    tf.float32, shape=[None, self.height_train, self.width_train, c.CHANNELS])
 
                 self.input_frames_test = tf.placeholder(
-                    tf.float32, shape=[None, self.height_test, self.width_test, 3 * c.HIST_LEN])
+                    tf.float32, shape=[None, self.height_test, self.width_test, c.CHANNELS * c.HIST_LEN])
                 self.gt_frames_test = tf.placeholder(
-                    tf.float32, shape=[None, self.height_test, self.width_test, 3])
+                    tf.float32, shape=[None, self.height_test, self.width_test, c.CHANNELS])
 
                 # use variable batch_size for more flexibility
                 self.batch_size_train = tf.shape(self.input_frames_train)[0]
@@ -114,7 +115,7 @@ class GeneratorModel:
                             if scale_num > 0:
                                 last_gen_frames = tf.image.resize_images(
                                     last_gen_frames,[scale_height, scale_width])
-                                inputs = tf.concat(3, [inputs, last_gen_frames])
+                                inputs = tf.concat([inputs, last_gen_frames], 3)
 
                             # generated frame predictions
                             preds = inputs
@@ -186,9 +187,9 @@ class GeneratorModel:
 
             with tf.name_scope('train'):
                 # global loss is the combined loss from every scale network
-                self.global_loss = combined_loss(self.scale_preds_train,
-                                                 self.scale_gts_train,
-                                                 self.d_scale_preds)
+                self.global_loss, self.lp_loss, self.gdl_loss, self.adv_loss = combined_loss(self.scale_preds_train,
+                                                                                             self.scale_gts_train,
+                                                                                             self.d_scale_preds)
                 self.global_step = tf.Variable(0, trainable=False)
                 self.optimizer = tf.train.AdamOptimizer(learning_rate=c.LRATE_G, name='optimizer')
                 self.train_op = self.optimizer.minimize(self.global_loss,
@@ -196,7 +197,7 @@ class GeneratorModel:
                                                         name='train_op')
 
                 # train loss summary
-                loss_summary = tf.scalar_summary('train_loss_G', self.global_loss)
+                loss_summary = tf.summary.scalar('train_loss_G', self.global_loss)
                 self.summaries_train.append(loss_summary)
 
             ##
@@ -215,29 +216,29 @@ class GeneratorModel:
                 self.sharpdiff_error_test = sharp_diff_error(self.scale_preds_test[-1],
                                                              self.gt_frames_test)
                 # train error summaries
-                summary_psnr_train = tf.scalar_summary('train_PSNR',
+                summary_psnr_train = tf.summary.scalar('train_PSNR',
                                                        self.psnr_error_train)
-                summary_sharpdiff_train = tf.scalar_summary('train_SharpDiff',
+                summary_sharpdiff_train = tf.summary.scalar('train_SharpDiff',
                                                             self.sharpdiff_error_train)
                 self.summaries_train += [summary_psnr_train, summary_sharpdiff_train]
 
                 # test error
-                summary_psnr_test = tf.scalar_summary('test_PSNR',
+                summary_psnr_test = tf.summary.scalar('test_PSNR',
                                                       self.psnr_error_test)
-                summary_sharpdiff_test = tf.scalar_summary('test_SharpDiff',
+                summary_sharpdiff_test = tf.summary.scalar('test_SharpDiff',
                                                            self.sharpdiff_error_test)
                 self.summaries_test += [summary_psnr_test, summary_sharpdiff_test]
 
             # add summaries to visualize in TensorBoard
-            self.summaries_train = tf.merge_summary(self.summaries_train)
-            self.summaries_test = tf.merge_summary(self.summaries_test)
+            self.summaries_train = tf.summary.merge(self.summaries_train)
+            self.summaries_test = tf.summary.merge(self.summaries_test)
 
-    def train_step(self, batch, discriminator=None):
+    def train_step(self, batch, save_img=False, discriminator=None):
         """
         Runs a training step using the global loss on each of the scale networks.
 
         @param batch: An array of shape
-                      [c.BATCH_SIZE x self.height x self.width x (3 * (c.HIST_LEN + 1))].
+                      [c.BATCH_SIZE x self.height x self.width x (c.CHANNELS * (c.HIST_LEN + 1))].
                       The input and output frames, concatenated along the channel axis (index 3).
         @param discriminator: The discriminator model. Default = None, if not adversarial.
 
@@ -247,8 +248,8 @@ class GeneratorModel:
         # Split into inputs and outputs
         ##
 
-        input_frames = batch[:, :, :, :-3]
-        gt_frames = batch[:, :, :, -3:]
+        input_frames = batch[:, :, :, :-c.CHANNELS]
+        gt_frames = batch[:, :, :, -c.CHANNELS:]
 
         ##
         # Train
@@ -263,21 +264,29 @@ class GeneratorModel:
             # Run the discriminator nets on those frames to get predictions
             d_feed_dict = {}
             for scale_num, gen_frames in enumerate(scale_preds):
-                d_feed_dict[discriminator.scale_nets[scale_num].input_frames] = gen_frames
+                input_resized = batch_resize(input_frames, gen_frames.shape[1], gen_frames.shape[2])
+                disc_input = np.concatenate((input_resized, gen_frames), axis=-1)
+                d_feed_dict[discriminator.scale_nets[scale_num].input_frames] = disc_input
             d_scale_preds = self.sess.run(discriminator.scale_preds, feed_dict=d_feed_dict)
 
             # Add discriminator predictions to the
             for i, preds in enumerate(d_scale_preds):
                 feed_dict[self.d_scale_preds[i]] = preds
 
-        _, global_loss, global_psnr_error, global_sharpdiff_error, global_step, summaries = \
+        _, global_loss, lp_loss, gdl_loss, adv_loss, global_psnr_error, global_sharpdiff_error, global_step, summaries = \
             self.sess.run([self.train_op,
                            self.global_loss,
+                           self.lp_loss,
+                           self.gdl_loss,
+                           self.adv_loss,
                            self.psnr_error_train,
                            self.sharpdiff_error_train,
                            self.global_step,
                            self.summaries_train],
                           feed_dict=feed_dict)
+
+        performance = {'gen_global_loss': global_loss, 'lp_loss': lp_loss, 'gdl_loss': gdl_loss,
+                       'adv_loss': adv_loss, 'trn_psnr': global_psnr_error, 'trn_sharpdiff': global_sharpdiff_error}
 
         ##
         # User output
@@ -289,10 +298,10 @@ class GeneratorModel:
             print '                 Sharpdiff Error: ', global_sharpdiff_error
         if global_step % c.SUMMARY_FREQ == 0:
             self.summary_writer.add_summary(summaries, global_step)
-            print 'GeneratorModel: saved summaries'
-        if global_step % c.IMG_SAVE_FREQ == 0:
-            print '-' * 30
-            print 'Saving images...'
+            # print 'GeneratorModel: saved summaries'
+        if save_img:
+            # print '-' * 30
+            # print 'Saving images...'
 
             # if not adversarial, we didn't get the preds for each scale net before for the
             # discriminator prediction, so do it now
@@ -307,23 +316,25 @@ class GeneratorModel:
                 scale_width = int(self.width_train * scale_factor)
 
                 # resize gt_output_frames for scale and append to scale_gts_train
-                scaled_gt_frames = np.empty([c.BATCH_SIZE, scale_height, scale_width, 3])
+                scaled_gt_frames = np.empty([c.BATCH_SIZE, scale_height, scale_width, c.CHANNELS])
                 for i, img in enumerate(gt_frames):
                     # for skimage.transform.resize, images need to be in range [0, 1], so normalize
                     # to [0, 1] before resize and back to [-1, 1] after
                     sknorm_img = (img / 2) + 0.5
-                    resized_frame = resize(sknorm_img, [scale_height, scale_width, 3])
+                    resized_frame = resize(sknorm_img, [scale_height, scale_width, c.CHANNELS])
                     scaled_gt_frames[i] = (resized_frame - 0.5) * 2
                 scale_gts.append(scaled_gt_frames)
 
             # for every clip in the batch, save the inputs, scale preds and scale gts
             for pred_num in xrange(len(input_frames)):
-                pred_dir = c.get_dir(os.path.join(c.IMG_SAVE_DIR, 'Step_' + str(global_step),
+                pred_dir = c.get_dir(os.path.join(c.IMG_SAVE_DIR, 'train', 'Step_' + str(global_step),
                                                   str(pred_num)))
 
                 # save input images
                 for frame_num in xrange(c.HIST_LEN):
-                    img = input_frames[pred_num, :, :, (frame_num * 3):((frame_num + 1) * 3)]
+                    img = input_frames[pred_num, :, :, (frame_num * c.CHANNELS):((frame_num + 1) * c.CHANNELS)]
+                    if c.CHANNELS == 1:
+                        img = np.squeeze(img)
                     imsave(os.path.join(pred_dir, 'input_' + str(frame_num) + '.png'), img)
 
                 # save preds and gts at each scale
@@ -333,21 +344,26 @@ class GeneratorModel:
 
                     path = os.path.join(pred_dir, 'scale' + str(scale_num))
                     gt_img = scale_gts[scale_num][pred_num]
+                    if c.CHANNELS == 1:
+                        gen_img = np.squeeze(gen_img)
+                        gt_img = np.squeeze(gt_img)
 
                     imsave(path + '_gen.png', gen_img)
                     imsave(path + '_gt.png', gt_img)
 
-            print 'Saved images!'
-            print '-' * 30
+            # print 'Saved images!'
+            # print '-' * 30
 
-        return global_step
+
+
+        return global_step, performance
 
     def test_batch(self, batch, global_step, num_rec_out=1, save_imgs=True):
         """
         Runs a training step using the global loss on each of the scale networks.
 
         @param batch: An array of shape
-                      [batch_size x self.height x self.width x (3 * (c.HIST_LEN+ num_rec_out))].
+                      [batch_size x self.height x self.width x (c.CHANNELS * (c.HIST_LEN+ num_rec_out))].
                       A batch of the input and output frames, concatenated along the channel axis
                       (index 3).
         @param global_step: The global step.
@@ -367,8 +383,8 @@ class GeneratorModel:
         # Split into inputs and outputs
         ##
 
-        input_frames = batch[:, :, :, :3 * c.HIST_LEN]
-        gt_frames = batch[:, :, :, 3 * c.HIST_LEN:]
+        input_frames = batch[:, :, :, :c.CHANNELS * c.HIST_LEN]
+        gt_frames = batch[:, :, :, c.CHANNELS * c.HIST_LEN:]
 
         ##
         # Generate num_rec_out recursive predictions
@@ -377,8 +393,10 @@ class GeneratorModel:
         working_input_frames = deepcopy(input_frames)  # input frames that will shift w/ recursion
         rec_preds = []
         rec_summaries = []
+        rec_psnr = []
+        rec_sharpdiff = []
         for rec_num in xrange(num_rec_out):
-            working_gt_frames = gt_frames[:, :, :, 3 * rec_num:3 * (rec_num + 1)]
+            working_gt_frames = gt_frames[:, :, :, c.CHANNELS * rec_num:c.CHANNELS * (rec_num + 1)]
 
             feed_dict = {self.input_frames_test: working_input_frames,
                          self.gt_frames_test: working_gt_frames}
@@ -390,15 +408,17 @@ class GeneratorModel:
 
             # remove first input and add new pred as last input
             working_input_frames = np.concatenate(
-                [working_input_frames[:, :, :, 3:], preds], axis=3)
+                [working_input_frames[:, :, :, c.CHANNELS:], preds], axis=3)
 
             # add predictions and summaries
             rec_preds.append(preds)
             rec_summaries.append(summaries)
+            rec_psnr.append(psnr)
+            rec_sharpdiff.append(sharpdiff)
 
-            print 'Recursion ', rec_num
-            print 'PSNR Error     : ', psnr
-            print 'Sharpdiff Error: ', sharpdiff
+            # print 'Recursion ', rec_num
+            # print 'PSNR Error     : ', psnr
+            # print 'Sharpdiff Error: ', sharpdiff
 
         # write summaries
         # TODO: Think of a good way to write rec output summaries - rn, just using first output.
@@ -411,18 +431,27 @@ class GeneratorModel:
         if save_imgs:
             for pred_num in xrange(len(input_frames)):
                 pred_dir = c.get_dir(os.path.join(
-                    c.IMG_SAVE_DIR, 'Tests/Step_' + str(global_step), str(pred_num)))
+                    c.IMG_SAVE_DIR, 'test/Step_' + str(global_step), str(pred_num)))
 
                 # save input images
                 for frame_num in xrange(c.HIST_LEN):
-                    img = input_frames[pred_num, :, :, (frame_num * 3):((frame_num + 1) * 3)]
+                    img = input_frames[pred_num, :, :, (frame_num * c.CHANNELS):((frame_num + 1) * c.CHANNELS)]
+                    if c.CHANNELS == 1:
+                        img = np.squeeze(img)
                     imsave(os.path.join(pred_dir, 'input_' + str(frame_num) + '.png'), img)
 
                 # save recursive outputs
                 for rec_num in xrange(num_rec_out):
                     gen_img = rec_preds[rec_num][pred_num]
-                    gt_img = gt_frames[pred_num, :, :, 3 * rec_num:3 * (rec_num + 1)]
+                    gt_img = gt_frames[pred_num, :, :, c.CHANNELS * rec_num:c.CHANNELS * (rec_num + 1)]
+                    if c.CHANNELS == 1:
+                        gen_img = np.squeeze(gen_img)
+                        gt_img = np.squeeze(gt_img)
                     imsave(os.path.join(pred_dir, 'gen_' + str(rec_num) + '.png'), gen_img)
                     imsave(os.path.join(pred_dir, 'gt_' + str(rec_num) + '.png'), gt_img)
 
+
+        print 'PSNR avg: ', np.mean(rec_psnr)
+        print 'Sharp diff avg: ', np.mean(rec_sharpdiff)
         print '-' * 30
+        return rec_psnr, rec_sharpdiff

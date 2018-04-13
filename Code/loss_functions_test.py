@@ -73,8 +73,8 @@ class TestLPLoss:
 
         res_tru = 0
         for i in xrange(1, NUM_SCALES + 1):
-            scale_preds.append(tf.constant(np.ones([BATCH_SIZE, 2**i, 2**i, 3])))
-            scale_truths.append(tf.constant(np.ones([BATCH_SIZE, 2**i, 2**i, 3])))
+            scale_preds.append(tf.constant(np.ones([BATCH_SIZE, 2**i, 2**i, c.CHANNELS])))
+            scale_truths.append(tf.constant(np.ones([BATCH_SIZE, 2**i, 2**i, c.CHANNELS])))
 
         for p in xrange(1, MAX_P + 1):
             res = sess.run(lp_loss(scale_preds, scale_truths, p))
@@ -87,10 +87,10 @@ class TestLPLoss:
 
         res_tru = 0
         for i in xrange(1, NUM_SCALES + 1):
-            scale_preds.append(tf.constant(np.zeros([BATCH_SIZE, 2**i, 2 ** i, 3])))
-            scale_truths.append(tf.constant(np.ones([BATCH_SIZE, 2**i, 2 ** i, 3])))
+            scale_preds.append(tf.constant(np.zeros([BATCH_SIZE, 2**i, 2 ** i, c.CHANNELS])))
+            scale_truths.append(tf.constant(np.ones([BATCH_SIZE, 2**i, 2 ** i, c.CHANNELS])))
 
-            res_tru += BATCH_SIZE * 2**i * 2**i * 3
+            res_tru += BATCH_SIZE * 2**i * 2**i * c.CHANNELS
 
         for p in xrange(1, MAX_P + 1):
             res = sess.run(lp_loss(scale_preds, scale_truths, p))
@@ -104,15 +104,15 @@ class TestLPLoss:
         res_tru = 0
         for i in xrange(1, NUM_SCALES + 1):
             # generate batch of 3-deep identity matrices
-            preds = np.empty([BATCH_SIZE, 2**i, 2**i, 3])
+            preds = np.empty([BATCH_SIZE, 2**i, 2**i, c.CHANNELS])
             imat = np.identity(2**i)
             for elt in xrange(BATCH_SIZE):
                 preds[elt] = np.dstack([imat, imat, imat])
 
             scale_preds.append(tf.constant(preds))
-            scale_truths.append(tf.constant(np.zeros([BATCH_SIZE, 2**i, 2**i, 3])))
+            scale_truths.append(tf.constant(np.zeros([BATCH_SIZE, 2**i, 2**i, c.CHANNELS])))
 
-            res_tru += BATCH_SIZE * 2**i * 3
+            res_tru += BATCH_SIZE * 2**i * c.CHANNELS
 
         for p in xrange(1, MAX_P + 1):
             res = sess.run(lp_loss(scale_preds, scale_truths, p))
@@ -126,12 +126,12 @@ class TestLPLoss:
         res_tru = 0
         for i in xrange(1, NUM_SCALES + 1):
             # opposite images
-            preds = np.empty([BATCH_SIZE, 2**i, 2**i, 3])
-            preds.fill(3)
+            preds = np.empty([BATCH_SIZE, 2**i, 2**i, c.CHANNELS])
+            preds.fill(c.CHANNELS)
             scale_preds.append(tf.constant(preds))
-            scale_truths.append(tf.constant(np.zeros([BATCH_SIZE, 2**i, 2**i, 3])))
+            scale_truths.append(tf.constant(np.zeros([BATCH_SIZE, 2**i, 2**i, c.CHANNELS])))
 
-            res_tru += BATCH_SIZE * 2**i * 2**i * 3
+            res_tru += BATCH_SIZE * 2**i * 2**i * c.CHANNELS
 
         for p in xrange(1, MAX_P + 1):
             res = sess.run(lp_loss(scale_preds, scale_truths, p))
@@ -147,8 +147,8 @@ class TestGDLLoss:
 
         res_tru = 0
         for i in xrange(1, NUM_SCALES + 1):
-            scale_preds.append(tf.ones([BATCH_SIZE, 2 ** i, 2 ** i, 3]))
-            scale_truths.append(tf.ones([BATCH_SIZE, 2 ** i, 2 ** i, 3]))
+            scale_preds.append(tf.ones([BATCH_SIZE, 2 ** i, 2 ** i, c.CHANNELS]))
+            scale_truths.append(tf.ones([BATCH_SIZE, 2 ** i, 2 ** i, c.CHANNELS]))
 
         for a in xrange(1, MAX_ALPHA + 1):
             res = sess.run(gdl_loss(scale_preds, scale_truths, a))
@@ -162,7 +162,7 @@ class TestGDLLoss:
         res_tru = 0
         for i in xrange(1, NUM_SCALES + 1):
             # generate batch of 3-deep identity matrices
-            arr = np.empty([BATCH_SIZE, 2 ** i, 2 ** i, 3])
+            arr = np.empty([BATCH_SIZE, 2 ** i, 2 ** i, c.CHANNELS])
             imat = np.identity(2 ** i)
             for elt in xrange(BATCH_SIZE):
                 arr[elt] = np.dstack([imat, imat, imat])
@@ -182,11 +182,11 @@ class TestGDLLoss:
 
         res_tru = 0
         for i in xrange(1, NUM_SCALES + 1):
-            scale_preds.append(tf.zeros([BATCH_SIZE, 2 ** i, 2 ** i, 3]))
-            scale_truths.append(tf.ones([BATCH_SIZE, 2 ** i, 2 ** i, 3]))
+            scale_preds.append(tf.zeros([BATCH_SIZE, 2 ** i, 2 ** i, c.CHANNELS]))
+            scale_truths.append(tf.ones([BATCH_SIZE, 2 ** i, 2 ** i, c.CHANNELS]))
 
             # every diff should have an abs value of 1, so no need for alpha handling
-            res_tru += BATCH_SIZE * 2 ** i * 2 * 3
+            res_tru += BATCH_SIZE * 2 ** i * 2 * c.CHANNELS
 
         for a in xrange(1, MAX_ALPHA + 1):
             res = sess.run(gdl_loss(scale_preds, scale_truths, a))
@@ -200,19 +200,19 @@ class TestGDLLoss:
         res_trus = np.zeros(MAX_ALPHA - 1)
         for i in xrange(1, NUM_SCALES + 1):
             # generate batch of 3-deep matrices with 3s on the diagonals
-            preds = np.empty([BATCH_SIZE, 2 ** i, 2 ** i, 3])
+            preds = np.empty([BATCH_SIZE, 2 ** i, 2 ** i, c.CHANNELS])
             imat = np.identity(2 ** i) * 3
             for elt in xrange(BATCH_SIZE):
                 preds[elt] = np.dstack([imat, imat, imat])
 
             scale_preds.append(tf.constant(preds, dtype=tf.float32))
-            scale_truths.append(tf.zeros([BATCH_SIZE, 2 ** i, 2 ** i, 3]))
+            scale_truths.append(tf.zeros([BATCH_SIZE, 2 ** i, 2 ** i, c.CHANNELS]))
 
             # every diff has an abs value of 3, so we can multiply that, raised to alpha
             # for each alpha check, times the number of diffs in a batch:
             # BATCH_SIZE * (diffs to left + down) * (diffs from up and right) * (# 3s in height) *
             # (# channels)
-            num_diffs = BATCH_SIZE * 2 * 2 * 2**i * 3
+            num_diffs = BATCH_SIZE * 2 * 2 * 2**i * c.CHANNELS
 
             for a in xrange(1, MAX_ALPHA):
                 res_trus[a] += num_diffs * 3**a

@@ -4,7 +4,8 @@ import numpy as np
 from tfutils import log10
 import constants as c
 
-def combined_loss(gen_frames, gt_frames, d_preds, lam_adv=1, lam_lp=1, lam_gdl=1, l_num=2, alpha=2):
+
+def combined_loss(gen_frames, gt_frames, d_preds):
     """
     Calculates the sum of the combined adversarial, lp and GDL losses in the given proportion. Used
     for training the generative model.
@@ -22,12 +23,14 @@ def combined_loss(gen_frames, gt_frames, d_preds, lam_adv=1, lam_lp=1, lam_gdl=1
     @return: The combined adversarial, lp and GDL losses.
     """
     batch_size = tf.shape(gen_frames[0])[0]  # variable batch size as a tensor
+    loss_lp = lp_loss(gen_frames, gt_frames, c.L_NUM)
+    loss_gdl = gdl_loss(gen_frames, gt_frames, c.ALPHA_NUM)
+    loss_adv, _, _ = adv_loss(d_preds, tf.ones([batch_size, 1]))
+    loss_global = c.LAM_LP * loss_lp
+    loss_global += c.LAM_GDL * loss_gdl
+    if c.ADVERSARIAL: loss_global += c.LAM_ADV * loss_adv
 
-    loss = lam_lp * lp_loss(gen_frames, gt_frames, l_num)
-    loss += lam_gdl * gdl_loss(gen_frames, gt_frames, alpha)
-    if c.ADVERSARIAL: loss += lam_adv * adv_loss(d_preds, tf.ones([batch_size, 1]))
-
-    return loss
+    return loss_global, loss_lp, loss_gdl, loss_adv
 
 
 def bce_loss(preds, targets):
@@ -41,8 +44,9 @@ def bce_loss(preds, targets):
 
     @return: The sum of binary cross-entropy losses.
     """
+    batch_size = tf.shape(preds)[0]
     return tf.squeeze(-1 * (tf.matmul(targets, log10(preds), transpose_a=True) +
-                            tf.matmul(1 - targets, log10(1 - preds), transpose_a=True)))
+                     tf.matmul(1 - targets, log10(1 - preds), transpose_a=True))) / tf.cast(batch_size, tf.float32)
 
 
 def lp_loss(gen_frames, gt_frames, l_num):
@@ -56,12 +60,13 @@ def lp_loss(gen_frames, gt_frames, l_num):
     @return: The lp loss.
     """
     # calculate the loss for each scale
+    batch_size = tf.shape(gen_frames[0])[0]
     scale_losses = []
     for i in xrange(len(gen_frames)):
-        scale_losses.append(tf.reduce_sum(tf.abs(gen_frames[i] - gt_frames[i])**l_num))
+        scale_losses.append(tf.reduce_mean(tf.abs(gen_frames[i] - gt_frames[i])**l_num))
 
     # condense into one tensor and avg
-    return tf.reduce_mean(tf.pack(scale_losses))
+    return tf.reduce_mean(tf.stack(scale_losses)) / tf.cast(batch_size, tf.float32)
 
 
 def gdl_loss(gen_frames, gt_frames, alpha):
@@ -75,13 +80,14 @@ def gdl_loss(gen_frames, gt_frames, alpha):
     @return: The GDL loss.
     """
     # calculate the loss for each scale
+    batch_size = tf.shape(gen_frames[0])[0]
     scale_losses = []
     for i in xrange(len(gen_frames)):
         # create filters [-1, 1] and [[1],[-1]] for diffing to the left and down respectively.
-        pos = tf.constant(np.identity(3), dtype=tf.float32)
+        pos = tf.constant(np.identity(c.CHANNELS), dtype=tf.float32)
         neg = -1 * pos
-        filter_x = tf.expand_dims(tf.pack([neg, pos]), 0)  # [-1, 1]
-        filter_y = tf.pack([tf.expand_dims(pos, 0), tf.expand_dims(neg, 0)])  # [[1],[-1]]
+        filter_x = tf.expand_dims(tf.stack([neg, pos]), 0)  # [-1, 1]
+        filter_y = tf.stack([tf.expand_dims(pos, 0), tf.expand_dims(neg, 0)])  # [[1],[-1]]
         strides = [1, 1, 1, 1]  # stride of (1, 1)
         padding = 'SAME'
 
@@ -93,10 +99,10 @@ def gdl_loss(gen_frames, gt_frames, alpha):
         grad_diff_x = tf.abs(gt_dx - gen_dx)
         grad_diff_y = tf.abs(gt_dy - gen_dy)
 
-        scale_losses.append(tf.reduce_sum((grad_diff_x ** alpha + grad_diff_y ** alpha)))
+        scale_losses.append(tf.reduce_mean((grad_diff_x ** alpha + grad_diff_y ** alpha)))
 
     # condense into one tensor and avg
-    return tf.reduce_mean(tf.pack(scale_losses))
+    return tf.reduce_mean(tf.stack(scale_losses)) / tf.cast(batch_size, tf.float32)
 
 
 def adv_loss(preds, labels):
@@ -109,10 +115,21 @@ def adv_loss(preds, labels):
     @return: The adversarial loss.
     """
     # calculate the loss for each scale
+    batch_size = tf.shape(labels[0])[0]
     scale_losses = []
+    real_losses = []
+    fake_losses = []
     for i in xrange(len(preds)):
         loss = bce_loss(preds[i], labels)
         scale_losses.append(loss)
+        fake_loss = bce_loss(preds[i][:batch_size/2], labels[:batch_size/2])
+        fake_losses.append(fake_loss)
+        real_loss = bce_loss(preds[i][batch_size/2:], labels[batch_size/2:])
+        real_losses.append(real_loss)
+        scale_losses.append(loss)
 
     # condense into one tensor and avg
-    return tf.reduce_mean(tf.pack(scale_losses))
+    av_loss = tf.reduce_mean(tf.stack(scale_losses))
+    av_real_loss = tf.reduce_mean(tf.stack(real_losses))
+    av_fake_loss = tf.reduce_mean(tf.stack(fake_losses))
+    return av_loss, av_real_loss, av_fake_loss

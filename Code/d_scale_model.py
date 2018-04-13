@@ -140,13 +140,14 @@ class DScaleModel:
                         else:
                             preds = tf.nn.relu(preds)
 
-                # clip preds between [.1, 0.9] for stability
+                # clip preds between [.0001, 0.9999] for stability
                 with tf.name_scope('clip'):
-                    preds = tf.clip_by_value(preds, 0.1, 0.9)
+                    preds = tf.clip_by_value(preds, 0.0001, 0.9999)
 
                 return preds
 
         self.preds = generate_predictions()
+
 
         ##
         # Training handled by DiscriminatorModel

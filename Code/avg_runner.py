@@ -2,15 +2,23 @@ import tensorflow as tf
 import getopt
 import sys
 import os
+import cPickle as pickle
+import numpy as np
+import time
+import datetime
 
-from utils import get_train_batch, get_test_batch
+from utils import get_train_batch, testBatcher
 import constants as c
 from g_model import GeneratorModel
 from d_model import DiscriminatorModel
-
+from performance import Performance
+from batch import Batcher
+from debug import display_batch
+from myutils import list_paths
 
 class AVGRunner:
-    def __init__(self, num_steps, model_load_path, num_test_rec):
+    def __init__(self, num_steps):
+
         """
         Initializes the Adversarial Video Generation Runner.
 
@@ -24,10 +32,10 @@ class AVGRunner:
 
         self.global_step = 0
         self.num_steps = num_steps
-        self.num_test_rec = num_test_rec
+        self.num_test_rec = c.NUM_TEST_REC
 
         self.sess = tf.Session()
-        self.summary_writer = tf.train.SummaryWriter(c.SUMMARY_SAVE_DIR, graph=self.sess.graph)
+        self.summary_writer = tf.summary.FileWriter(c.SUMMARY_SAVE_DIR, graph=self.sess.graph)
 
         if c.ADVERSARIAL:
             print 'Init discriminator...'
@@ -49,53 +57,136 @@ class AVGRunner:
                                       c.SCALE_FMS_G,
                                       c.SCALE_KERNEL_SIZES_G)
 
+        self.summary_writer = tf.summary.FileWriter(c.SUMMARY_SAVE_DIR, graph=self.sess.graph)
+
         print 'Init variables...'
         self.saver = tf.train.Saver(keep_checkpoint_every_n_hours=2)
         self.sess.run(tf.global_variables_initializer())
 
         # if load path specified, load a saved model
-        if model_load_path is not None:
-            self.saver.restore(self.sess, model_load_path)
-            print 'Model restored from ' + model_load_path
+        if c.LOAD_MODEL is not None:
+            self.saver.restore(self.sess, c.MODEL_LOAD_PATH)
+            print 'Model restored from ' + c.MODEL_LOAD_PATH
 
     def train(self):
         """
         Runs a training loop on the model networks.
         """
-        for i in xrange(self.num_steps):
-            if c.ADVERSARIAL:
-                # update discriminator
-                batch = get_train_batch()
-                print 'Training discriminator...'
-                self.d_model.train_step(batch, self.g_model)
+        performance_saver = Performance()
 
-            # update generator
-            batch = get_train_batch()
-            print 'Training generator...'
-            self.global_step = self.g_model.train_step(
-                batch, discriminator=(self.d_model if c.ADVERSARIAL else None))
 
-            # save the models
-            if self.global_step % c.MODEL_SAVE_FREQ == 0:
-                print '-' * 30
-                print 'Saving models...'
-                self.saver.save(self.sess,
-                                c.MODEL_SAVE_DIR + 'model.ckpt',
-                                global_step=self.global_step)
-                print 'Saved models!'
-                print '-' * 30
+        remove_model = None
+
+        once = True
+
+        for epoch in xrange(c.EPOCHS):
+            epoch_done = False
+            step = 0
+            t1 = time.time()
+            f = open('remaining.txt', 'w')
+            f.write('EPOCH: ' + str(epoch) + '\n')
+            f.close()
+            batcher_disc = Batcher('train')
+            dataset_size = batcher_disc.dataset_size()
+            batcher_gen = Batcher('train')
+            save_img = True
+            while not epoch_done:
+
+                if c.ADVERSARIAL:
+                    # update discriminator
+                    try:
+                        batch, disc_done = batcher_disc.get()
+                    except Exception as e:
+                        print(e)
+                        print 'Read error: ', batcher_disc.path
+                        continue
+                    # print 'Training discriminator...'
+                    _, disc_loss_batch, disc_real_loss_batch, disc_fake_loss_batch = self.d_model.train_step(batch, self.g_model)
+                # update generator
+                try:
+                    batch, gen_done = batcher_gen.get()
+                except Exception as e:
+                    print(e)
+                    print 'Read error: ', batcher_disc.path
+                    continue
+                # print 'Training generator...'
+                self.global_step, gen_performance = self.g_model.train_step(
+                    batch, save_img=save_img, discriminator=(self.d_model if c.ADVERSARIAL else None))
+                disc_performance = {'disc_global_loss': disc_loss_batch, 'disc_real_loss': disc_real_loss_batch,
+                                    'disc_fake_loss': disc_fake_loss_batch}
+                performance_all = dict(disc_performance.items() + gen_performance.items())
+                performance_saver.update(performance_all)
+
+                epoch_done = disc_done or gen_done
+
+                step += 1
+                if step % 100 == 0:
+                    t2 = time.time()
+                    f = open('remaining.txt', 'a')
+                    f.write(str((t2 - t1)/60) + '\t' + str(batcher_disc.remaining()) + '\n')
+                    print(str(t2 - t1) + '\t' + str(batcher_disc.remaining()) + '\n')
+                    f.close()
+
+                if once:
+                    np.save('done', [])
+                    print 'First batch done'
+                    np.save('done', [])
+                    once = False
+
+
 
             # test generator model
-            if self.global_step % c.TEST_FREQ == 0:
-                self.test()
+            #if self.global_step % c.TEST_FREQ == 0:
+            tst_psnr_av, tst_sharpdiff_av = self.test()
+            # else:
+            #     tst_psnr_av, tst_sharpdiff_av = None, None
+
+            #if self.global_step % c.STATS_FREQ == 0:
+            performance_saver.save(dataset_size, tst_psnr_av=tst_psnr_av, tst_sharpdiff_av=tst_sharpdiff_av)
+                #performance_saver.save()
+
+            # save the models
+            #if self.global_step % c.MODEL_SAVE_FREQ == 0:
+                # print '-' * 30
+                # print 'Saving models...'
+
+            self.saver.save(self.sess,
+                            c.MODEL_SAVE_DIR + '/model.ckpt',
+                            global_step=epoch)
+
+                # if remove_model:
+                #     os.remove(c.MODEL_SAVE_DIR + '/model.ckpt-' + str(remove_model) + '.data-00000-of-00001')
+                #     os.remove(c.MODEL_SAVE_DIR + '/model.ckpt-' + str(remove_model) + '.index')
+                #     os.remove(c.MODEL_SAVE_DIR + '/model.ckpt-' + str(remove_model) + '.meta')
+                #
+                # if self.global_step % c.MODEL_KEEP_FREQ == 0:
+                #     remove_model = None
+                # else:
+                #     remove_model = self.global_step
+
 
     def test(self):
         """
         Runs one test step on the generator network.
         """
-        batch = get_test_batch(c.BATCH_SIZE, num_rec_out=self.num_test_rec)
-        self.g_model.test_batch(
-            batch, self.global_step, num_rec_out=self.num_test_rec)
+        psnr = np.zeros(c.NUM_TEST_REC)
+        sharpdiff = np.zeros(c.NUM_TEST_REC)
+        batch_count = 0
+        batcher_test = Batcher('test')
+        save_imgs = True
+        test_done = False
+        while not test_done:
+            batch, test_done = batcher_test.get()
+            batch_psnr, batch_sharpdiff = self.g_model.test_batch(batch, self.global_step, save_imgs=save_imgs)
+            psnr += batch_psnr
+            sharpdiff += batch_sharpdiff
+            batch_count += 1
+            save_imgs = False
+
+        psnr /= batch_count
+        sharpdiff /= batch_count
+
+        return psnr, sharpdiff
 
 
 def usage():
@@ -121,10 +212,9 @@ def main():
     # Handle command line input.
     ##
 
-    load_path = None
     test_only = False
-    num_test_rec = 1  # number of recursive predictions to make on test
-    num_steps = 1000001
+    num_test_rec = c.NUM_TEST_REC  # number of recursive predictions to make on test
+    num_steps = 100000
     try:
         opts, _ = getopt.getopt(sys.argv[1:], 'l:t:r:a:n:s:OTH',
                                 ['load_path=', 'test_dir=', 'recursions=', 'adversarial=', 'name=',
@@ -137,15 +227,15 @@ def main():
 
     for opt, arg in opts:
         if opt in ('-l', '--load_path'):
-            load_path = arg
+            c.LOAD_MODEL = arg
         if opt in ('-t', '--test_dir'):
             c.set_test_dir(arg)
         if opt in ('-r', '--recursions'):
             num_test_rec = int(arg)
         if opt in ('-a', '--adversarial'):
             c.ADVERSARIAL = (arg.lower() == 'true' or arg.lower() == 't')
-        if opt in ('-n', '--name'):
-            c.set_save_name(arg)
+        # if opt in ('-n', '--name'):
+        #     c.set_save_name(arg)
         if opt in ('-s', '--steps'):
             num_steps = int(arg)
         if opt in ('-O', '--overwrite'):
@@ -168,13 +258,13 @@ def main():
 
     # set test frame dimensions
     assert os.path.exists(c.TEST_DIR)
-    c.FULL_HEIGHT, c.FULL_WIDTH = c.get_test_frame_dims()
+    #.FULL_HEIGHT, c.FULL_WIDTH = c.get_test_frame_dims()
 
     ##
     # Init and run the predictor
     ##
 
-    runner = AVGRunner(num_steps, load_path, num_test_rec)
+    runner = AVGRunner(num_steps)
     if test_only:
         runner.test()
     else:
