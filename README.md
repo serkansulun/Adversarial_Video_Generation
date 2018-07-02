@@ -1,3 +1,15 @@
+Made the changes to original implementation:
+
+- Moved to Pytorch.
+- Gradients flow from adversarial loss also.
+- Discriminator takes a sequence of frames instead of a single frame.
+
+Different from the original paper:
+
+- Training is done on whole frame instead of patches (TODO).
+- Tested on KTH action dataset.
+
+
 # Adversarial Video Generation
 This project implements a generative adversarial network to predict future frames of video, as detailed in 
 ["Deep Multi-Scale Video Prediction Beyond Mean Square Error"](https://arxiv.org/abs/1511.05440) by Mathieu, 
