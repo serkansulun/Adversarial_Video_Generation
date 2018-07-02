@@ -20,7 +20,7 @@ LEAK = 0.2  # for leaky relu
 
 BATCH_NORM = True   # only for the generator
 
-BATCH_SIZE = 4  # the training minibatch size
+BATCH_SIZE = 8  # the training minibatch size
 
 TEST_ONLY = False
 SAVE_MODEL = True
