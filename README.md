@@ -4,10 +4,14 @@ Made the changes to original implementation:
 - Gradients flow from adversarial loss also.
 - Discriminator takes a sequence of frames instead of a single frame.
 
-Different from the original paper:
+Different from the paper:
 
 - Training is done on whole frame instead of patches (TODO).
 - Tested on KTH action dataset.
+
+The script "videos_to_frames.sh" converts KTH dataset videos into frames. ffmpeg is required.
+
+Stable training is not guaranteed. Still under development for personal research.
 
 
 # Adversarial Video Generation
