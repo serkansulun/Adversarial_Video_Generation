@@ -1,10 +1,12 @@
-import tensorflow as tf
 import numpy as np
+import torch.nn.functional as F
+import torch
 
-from tfutils import log10
+from pytorch_msssim import ssim
 import constants as c
 
-def combined_loss(gen_frames, gt_frames, d_preds, lam_adv=1, lam_lp=1, lam_gdl=1, l_num=2, alpha=2):
+
+def combined_loss(gen_frames, gt_frames, preds=None):
     """
     Calculates the sum of the combined adversarial, lp and GDL losses in the given proportion. Used
     for training the generative model.
@@ -21,13 +23,18 @@ def combined_loss(gen_frames, gt_frames, d_preds, lam_adv=1, lam_lp=1, lam_gdl=1
 
     @return: The combined adversarial, lp and GDL losses.
     """
-    batch_size = tf.shape(gen_frames[0])[0]  # variable batch size as a tensor
 
-    loss = lam_lp * lp_loss(gen_frames, gt_frames, l_num)
-    loss += lam_gdl * gdl_loss(gen_frames, gt_frames, alpha)
-    if c.ADVERSARIAL: loss += lam_adv * adv_loss(d_preds, tf.ones([batch_size, 1]))
+    batch_size = gen_frames[0].size()[0]  # variable batch size as a tensor
+    loss_lp = lp_loss(gen_frames, gt_frames, c.L_NUM)
+    loss_gdl = gdl_loss(gen_frames, gt_frames)
 
-    return loss
+    loss_global = c.LAMBDAS[0] * loss_lp
+    loss_global += c.LAMBDAS[1] * loss_gdl
+    if c.ADVERSARIAL:
+        loss_adv = adv_loss(preds, torch.ones([batch_size, 1]))
+        loss_global += c.LAMBDAS[2] * loss_adv
+
+    return loss_global
 
 
 def bce_loss(preds, targets):
@@ -41,8 +48,8 @@ def bce_loss(preds, targets):
 
     @return: The sum of binary cross-entropy losses.
     """
-    return tf.squeeze(-1 * (tf.matmul(targets, log10(preds), transpose_a=True) +
-                            tf.matmul(1 - targets, log10(1 - preds), transpose_a=True)))
+    return F.binary_cross_entropy(preds, targets)
+
 
 
 def lp_loss(gen_frames, gt_frames, l_num):
@@ -56,15 +63,16 @@ def lp_loss(gen_frames, gt_frames, l_num):
     @return: The lp loss.
     """
     # calculate the loss for each scale
+    # batch_size = torch.shape(gen_frames[0])[0]
     scale_losses = []
     for i in xrange(len(gen_frames)):
-        scale_losses.append(tf.reduce_sum(tf.abs(gen_frames[i] - gt_frames[i])**l_num))
+        scale_losses.append(torch.mean(torch.abs(gen_frames[i] - gt_frames[i])**l_num))
 
     # condense into one tensor and avg
-    return tf.reduce_mean(tf.pack(scale_losses))
+    return torch.mean(torch.stack(scale_losses))
 
 
-def gdl_loss(gen_frames, gt_frames, alpha):
+def gdl_loss(gen_frames, gt_frames):
     """
     Calculates the sum of GDL losses between the predicted and ground truth frames.
 
@@ -75,28 +83,29 @@ def gdl_loss(gen_frames, gt_frames, alpha):
     @return: The GDL loss.
     """
     # calculate the loss for each scale
+    # batch_size = torch.shape(gen_frames[0])[0]
     scale_losses = []
     for i in xrange(len(gen_frames)):
         # create filters [-1, 1] and [[1],[-1]] for diffing to the left and down respectively.
-        pos = tf.constant(np.identity(3), dtype=tf.float32)
+        pos = torch.from_numpy(np.identity(c.CHANNELS, dtype=np.float32))
+        if c.CUDA:
+            pos = pos.cuda()
         neg = -1 * pos
-        filter_x = tf.expand_dims(tf.pack([neg, pos]), 0)  # [-1, 1]
-        filter_y = tf.pack([tf.expand_dims(pos, 0), tf.expand_dims(neg, 0)])  # [[1],[-1]]
-        strides = [1, 1, 1, 1]  # stride of (1, 1)
-        padding = 'SAME'
+        filter_x = torch.stack([neg, pos], dim=2).unsqueeze(2)  # [-1, 1]
+        filter_y = torch.stack([neg, pos], dim=2).unsqueeze(-1)  # [[1],[-1]]
 
-        gen_dx = tf.abs(tf.nn.conv2d(gen_frames[i], filter_x, strides, padding=padding))
-        gen_dy = tf.abs(tf.nn.conv2d(gen_frames[i], filter_y, strides, padding=padding))
-        gt_dx = tf.abs(tf.nn.conv2d(gt_frames[i], filter_x, strides, padding=padding))
-        gt_dy = tf.abs(tf.nn.conv2d(gt_frames[i], filter_y, strides, padding=padding))
+        gen_dx = torch.abs(F.conv2d(gen_frames[i], filter_x))
+        gen_dy = torch.abs(F.conv2d(gen_frames[i], filter_y))
+        gt_dx = torch.abs(F.conv2d(gt_frames[i], filter_x))
+        gt_dy = torch.abs(F.conv2d(gt_frames[i], filter_y))
 
-        grad_diff_x = tf.abs(gt_dx - gen_dx)
-        grad_diff_y = tf.abs(gt_dy - gen_dy)
+        grad_diff_x = torch.abs(gt_dx - gen_dx)
+        grad_diff_y = torch.abs(gt_dy - gen_dy)
 
-        scale_losses.append(tf.reduce_sum((grad_diff_x ** alpha + grad_diff_y ** alpha)))
+        scale_losses.append(torch.mean(grad_diff_x ** c.ALPHA_NUM) + torch.mean(grad_diff_y ** c.ALPHA_NUM))
 
     # condense into one tensor and avg
-    return tf.reduce_mean(tf.pack(scale_losses))
+    return torch.mean(torch.stack(scale_losses))
 
 
 def adv_loss(preds, labels):
@@ -109,10 +118,13 @@ def adv_loss(preds, labels):
     @return: The adversarial loss.
     """
     # calculate the loss for each scale
+    batch_size = labels.size()[0]
     scale_losses = []
+
     for i in xrange(len(preds)):
         loss = bce_loss(preds[i], labels)
         scale_losses.append(loss)
 
     # condense into one tensor and avg
-    return tf.reduce_mean(tf.pack(scale_losses))
+    av_loss = torch.mean(torch.stack(scale_losses))
+    return av_loss

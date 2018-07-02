@@ -1,185 +1,185 @@
-import tensorflow as tf
-import getopt
 import sys
 import os
+import torch
+from copy import deepcopy
 
-from utils import get_train_batch, get_test_batch
-import constants as c
 from g_model import GeneratorModel
 from d_model import DiscriminatorModel
+import constants as c
+from batch import Batcher as Batcher
+from utils import save_samples, calculate_psnr, calculate_sharp_psnr, RunningAverage
+from pytorch_msssim import ssim as calculate_ssim
+from loss_functions import combined_loss, adv_loss
 
 
-class AVGRunner:
-    def __init__(self, num_steps, model_load_path, num_test_rec):
-        """
-        Initializes the Adversarial Video Generation Runner.
+class Runner:
+    def __init__(self):
 
-        @param num_steps: The number of training steps to run.
-        @param model_load_path: The path from which to load a previously-saved model.
-                                Default = None.
-        @param num_test_rec: The number of recursive generations to produce when testing. Recursive
-                             generations use previous generations as input to predict further into
-                             the future.
-        """
+        self.g_model = GeneratorModel()
+        if c.CUDA:
+            self.g_model.cuda()
 
-        self.global_step = 0
-        self.num_steps = num_steps
-        self.num_test_rec = num_test_rec
+        self.batcher_tst = Batcher('test')
 
-        self.sess = tf.Session()
-        self.summary_writer = tf.train.SummaryWriter(c.SUMMARY_SAVE_DIR, graph=self.sess.graph)
+        if not c.TEST_ONLY:
+            self.batcher_trn = Batcher('train')
+            self.g_optimizer = torch.optim.Adam(self.g_model.parameters(), lr=c.LRATE_G)
 
-        if c.ADVERSARIAL:
-            print 'Init discriminator...'
-            self.d_model = DiscriminatorModel(self.sess,
-                                              self.summary_writer,
-                                              c.TRAIN_HEIGHT,
-                                              c.TRAIN_WIDTH,
-                                              c.SCALE_CONV_FMS_D,
-                                              c.SCALE_KERNEL_SIZES_D,
-                                              c.SCALE_FC_LAYER_SIZES_D)
+            if c.ADVERSARIAL:
+                self.d_model = DiscriminatorModel()
+                self.d_optimizer = torch.optim.Adam(self.d_model.parameters(), lr=c.LRATE_D, weight_decay=c.REG_D)
 
-        print 'Init generator...'
-        self.g_model = GeneratorModel(self.sess,
-                                      self.summary_writer,
-                                      c.TRAIN_HEIGHT,
-                                      c.TRAIN_WIDTH,
-                                      c.FULL_HEIGHT,
-                                      c.FULL_WIDTH,
-                                      c.SCALE_FMS_G,
-                                      c.SCALE_KERNEL_SIZES_G)
+                if c.CUDA:
+                    self.d_model.cuda()
 
-        print 'Init variables...'
-        self.saver = tf.train.Saver(keep_checkpoint_every_n_hours=2)
-        self.sess.run(tf.global_variables_initializer())
+            self.epoch = 0
 
-        # if load path specified, load a saved model
-        if model_load_path is not None:
-            self.saver.restore(self.sess, model_load_path)
-            print 'Model restored from ' + model_load_path
+        if c.LOAD_MODEL is not None:
+            self.load_model()
+
+    def one_epoch(self, batcher):
+
+        mode = batcher.mode
+        if mode == 'train':
+            self.g_model.train()
+            if c.ADVERSARIAL:
+                self.d_model.eval()
+
+        elif mode == 'test':
+            self.g_model.eval()
+        else:
+            sys.exit('Mode can be train or test')
+
+        dataset_done = False
+        batcher.new()
+        performance = {}
+        averager = RunningAverage()
+
+        while not dataset_done:
+            # create minibatches
+            history, gt, dataset_done = batcher.get()
+
+            # DISCRIMINATOR
+            if c.ADVERSARIAL and mode == 'train':
+                self.d_model.zero_grad()
+
+                # run generator to create fake samples
+                # detach generator from discriminator training
+                fake_disc_generation = [generation.detach() for generation in self.g_model(history)]
+                # create fake and real sequences
+                disc_input_for_disc = []
+                for i in range(c.NUM_SCALE_NETS):
+                    fake_sequence = torch.cat([history[i], fake_disc_generation[i]], 1)
+                    real_sequence = torch.cat([history[i], gt[i]], 1)
+                    disc_input_for_disc.append(torch.cat([fake_sequence, real_sequence], 0))
+
+                disc_labels = torch.cat([torch.zeros((fake_sequence.shape[0], 1)),
+                                         torch.ones((real_sequence.shape[0], 1))])
+                disc_labels.requires_grad = False
+                # Run discriminator
+                preds = self.d_model(disc_input_for_disc)
+                disc_loss = adv_loss(preds, disc_labels)
+
+                # Train discriminator
+                disc_loss.backward()
+                self.d_optimizer.step()
+
+                performance.update({'disc_loss': disc_loss})
+            else:
+                preds = None
+
+            # GENERATOR
+
+            self.g_model.zero_grad()
+
+            # Run generator and discriminator again, since generator was previously detached
+            generation = self.g_model(history)
+
+            psnr = calculate_psnr(generation[-1], gt[-1])     # calculate PSNR on largest scale
+            sharp_psnr = calculate_sharp_psnr(generation[-1], gt[-1])
+            ssim = calculate_ssim(generation[-1], gt[-1], val_range=2)
+
+            performance.update({'psnr': psnr, 'sharp_psnr': sharp_psnr, 'ssim': ssim})
+
+            if mode == 'train':
+                if c.ADVERSARIAL:
+                    disc_input_for_gen = []
+                    for i in range(c.NUM_SCALE_NETS):
+                        disc_input_for_gen.append(torch.cat([history[i], generation[i]], 1))
+                    gen_preds = self.d_model(disc_input_for_gen)
+                    gen_labels = torch.ones(gen_preds[0].shape[0], 1)
+                    gen_labels.requires_grad = False
+                else:
+                    gen_preds = None
+
+                gen_loss = combined_loss(generation, gt, preds=gen_preds)
+                gen_loss.backward()
+                self.g_optimizer.step()
+
+                performance.update({'gen_loss': gen_loss})
+
+        averager.update(performance)
+        save_samples(history, gt, generation, self.epoch, mode)
+
+        return averager.values()
 
     def train(self):
         """
         Runs a training loop on the model networks.
         """
-        for i in xrange(self.num_steps):
-            if c.ADVERSARIAL:
-                # update discriminator
-                batch = get_train_batch()
-                print 'Training discriminator...'
-                self.d_model.train_step(batch, self.g_model)
+        while self.epoch < c.EPOCHS:
+            performance_trn = self.one_epoch(self.batcher_trn)    # train
+            performance_tst = self.one_epoch(self.batcher_tst)   # test
+            print('Epoch {:2d}: Train: Gen loss: {:.3f}, Disc loss: {:.3f}, Test: PSNR: {:.3f}, Sharp PSNR: {:.3f}, SSIM: {:.3f}'.format(
+                  self.epoch+1, performance_trn['gen_loss'], performance_trn['disc_loss'], performance_tst['psnr'],
+                  performance_tst['sharp_psnr'], performance_tst['ssim']))
 
-            # update generator
-            batch = get_train_batch()
-            print 'Training generator...'
-            self.global_step = self.g_model.train_step(
-                batch, discriminator=(self.d_model if c.ADVERSARIAL else None))
-
-            # save the models
-            if self.global_step % c.MODEL_SAVE_FREQ == 0:
-                print '-' * 30
-                print 'Saving models...'
-                self.saver.save(self.sess,
-                                c.MODEL_SAVE_DIR + 'model.ckpt',
-                                global_step=self.global_step)
-                print 'Saved models!'
-                print '-' * 30
-
-            # test generator model
-            if self.global_step % c.TEST_FREQ == 0:
-                self.test()
+            if c.SAVE_MODEL:
+                self.save_model()
+            self.epoch += 1
 
     def test(self):
-        """
-        Runs one test step on the generator network.
-        """
-        batch = get_test_batch(c.BATCH_SIZE, num_rec_out=self.num_test_rec)
-        self.g_model.test_batch(
-            batch, self.global_step, num_rec_out=self.num_test_rec)
 
+        performance_tst = self.one_epoch(self.batcher_tst)
+        print('PSNR: {:.3f}, Sharp PSNR: {:.3f}, SSIM: {:.3f}'.format(performance_tst['psnr'],
+              performance_tst['sharp_psnr'], performance_tst['ssim']))
 
-def usage():
-    print 'Options:'
-    print '-l/--load_path=    <Relative/path/to/saved/model>'
-    print '-t/--test_dir=     <Directory of test images>'
-    print '-r/--recursions=   <# recursive predictions to make on test>'
-    print '-a/--adversarial=  <{t/f}> (Whether to use adversarial training. Default=True)'
-    print '-n/--name=         <Subdirectory of ../Data/Save/*/ in which to save output of this run>'
-    print '-s/--steps=        <Number of training steps to run> (Default=1000001)'
-    print '-O/--overwrite     (Overwrites all previous data for the model with this save name)'
-    print '-T/--test_only     (Only runs a test step -- no training)'
-    print '-H/--help          (Prints usage)'
-    print '--stats_freq=      <How often to print loss/train error stats, in # steps>'
-    print '--summary_freq=    <How often to save loss/error summaries, in # steps>'
-    print '--img_save_freq=   <How often to save generated images, in # steps>'
-    print '--test_freq=       <How often to test the model on test data, in # steps>'
-    print '--model_save_freq= <How often to save the model, in # steps>'
+    def save_model(self):
+        g_model_copy = deepcopy(self.g_model)
+        data = {'epoch': self.epoch+1, 'gen_optim': self.g_optimizer.state_dict(),
+                'gen_model': g_model_copy.cpu().state_dict()}
+
+        if c.ADVERSARIAL:
+            d_model_copy = deepcopy(self.d_model)
+            data.update({'disc_model': d_model_copy.cpu().state_dict()})
+            data.update({'disc_optim': self.d_optimizer.state_dict()})
+        torch.save(data, c.MODEL_DIR + '/' + c.EXPERIMENT_NAME + '.pt')
+
+    def load_model(self):
+
+        data = torch.load(os.path.join(c.MODEL_DIR, c.LOAD_MODEL + '.pt'), map_location=lambda storage, loc: storage)
+        self.epoch = data['epoch']
+        self.g_model.load_state_dict(data['gen_model'])
+        self.g_optimizer.load_state_dict(data['gen_optim'])
+
+        # Adjust learning rate to a newly defined one
+        for param in self.g_optimizer.param_groups:
+            param['lr'] = c.LRATE_G
+        if c.ADVERSARIAL and 'disc_model' in data.keys():
+            self.d_model.load_state_dict(data['disc_model'])
+            self.d_optimizer.load_state_dict(data['disc_optim'])
+            for param in self.d_optimizer.param_groups:
+                param['lr'] = c.LRATE_D
+        print 'Restored model'
 
 
 def main():
-    ##
-    # Handle command line input.
-    ##
 
-    load_path = None
-    test_only = False
-    num_test_rec = 1  # number of recursive predictions to make on test
-    num_steps = 1000001
-    try:
-        opts, _ = getopt.getopt(sys.argv[1:], 'l:t:r:a:n:s:OTH',
-                                ['load_path=', 'test_dir=', 'recursions=', 'adversarial=', 'name=',
-                                 'steps=', 'overwrite', 'test_only', 'help', 'stats_freq=',
-                                 'summary_freq=', 'img_save_freq=', 'test_freq=',
-                                 'model_save_freq='])
-    except getopt.GetoptError:
-        usage()
-        sys.exit(2)
-
-    for opt, arg in opts:
-        if opt in ('-l', '--load_path'):
-            load_path = arg
-        if opt in ('-t', '--test_dir'):
-            c.set_test_dir(arg)
-        if opt in ('-r', '--recursions'):
-            num_test_rec = int(arg)
-        if opt in ('-a', '--adversarial'):
-            c.ADVERSARIAL = (arg.lower() == 'true' or arg.lower() == 't')
-        if opt in ('-n', '--name'):
-            c.set_save_name(arg)
-        if opt in ('-s', '--steps'):
-            num_steps = int(arg)
-        if opt in ('-O', '--overwrite'):
-            c.clear_save_name()
-        if opt in ('-H', '--help'):
-            usage()
-            sys.exit(2)
-        if opt in ('-T', '--test_only'):
-            test_only = True
-        if opt == '--stats_freq':
-            c.STATS_FREQ = int(arg)
-        if opt == '--summary_freq':
-            c.SUMMARY_FREQ = int(arg)
-        if opt == '--img_save_freq':
-            c.IMG_SAVE_FREQ = int(arg)
-        if opt == '--test_freq':
-            c.TEST_FREQ = int(arg)
-        if opt == '--model_save_freq':
-            c.MODEL_SAVE_FREQ = int(arg)
-
-    # set test frame dimensions
-    assert os.path.exists(c.TEST_DIR)
-    c.FULL_HEIGHT, c.FULL_WIDTH = c.get_test_frame_dims()
-
-    ##
-    # Init and run the predictor
-    ##
-
-    runner = AVGRunner(num_steps, load_path, num_test_rec)
-    if test_only:
+    runner = Runner()
+    if c.TEST_ONLY:
         runner.test()
     else:
         runner.train()
-
 
 if __name__ == '__main__':
     main()
